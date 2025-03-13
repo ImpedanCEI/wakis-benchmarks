@@ -2,7 +2,7 @@ import os, sys
 import numpy as np
 import pyvista as pv
 import matplotlib.pyplot as plt
-from scipy.constants import c 
+from scipy.constants import c, epsilon_0
 
 sys.path.append('../../wakis')
 
@@ -24,22 +24,31 @@ stl_windows = 'BE_windows.stl'
 # Materials
 stl_solids = {'walls': stl_walls,
               'vacuum' : stl_vacuum,
-              #'windows' : stl_windows
+              'windows' : stl_windows
               }
 
 stl_scale = [1e-3, 1e-3, 1e-3]
 
 stl_materials = {'walls': [5.8e+07, 1.0, 5.8e+07],
                  'vacuum' : [1.0, 1.0, 0.0],
-                 #'windows' : [2.5e+07, 1.0, 2.5e+07]
+                 'windows' : [2.5e+07, 1.0, 2.5e+07]
                  }
 
 background = 'pec' 
 
 # Domain bounds
-surf = pv.read(stl_walls)+pv.read(stl_vacuum)#+pv.read(stl_windows)
+surf = pv.read(stl_walls)+pv.read(stl_vacuum)+pv.read(stl_windows)
 surf = surf.scale(stl_scale)
 xmin, xmax, ymin, ymax, zmin, zmax = surf.bounds
+
+n_pml = 0
+use_pml = True
+if use_pml: #for pml
+    n_pml = 10
+    dz = (zmax-zmin)/Nz
+    zmin -= n_pml*dz
+    zmax += n_pml*dz
+    Nz += 2*n_pml
 
 # Set grid and geometry
 grid = GridFIT3D(xmin, xmax, ymin, ymax, zmin, zmax, Nx, Ny, Nz, 
@@ -51,8 +60,8 @@ grid = GridFIT3D(xmin, xmax, ymin, ymax, zmin, zmax, Nx, Ny, Nz,
 
 # ------------ Beam source ----------------
 # Beam parameters
-beta = 0.899        # beam relativistic beta 
-sigmaz = beta*26.302e-3 # [m] -> multiplied by beta to have f_max cte
+beta =  0.88888109        # beam relativistic beta 
+sigmaz = beta*26.302e-3   # [m] -> multiplied by beta to have f_max cte
 q = 1e-9            # [C]
 xs = 0.             # x source position [m]
 ys = 0.             # y source position [m]
@@ -60,10 +69,10 @@ xt = 0.             # x test position [m]
 yt = 0.             # y test position [m]
 tinj = 8.54*sigmaz/(np.sqrt(beta)*beta*c)  # injection time offset [s] 
 
-# Simualtion
-wakelength = 10*sigmaz+tinj  #[m]
+# Simualtion length
+wakelength = 10*sigmaz  #[m]
 add_space = 0   # no. cells
-results_folder = f'results_lossy_BCpec_nz150/'
+results_folder = f'results_lossy+windows_BCpml_nz150_addspace_tinj/'
 
 wake = WakeSolver(q=q, sigmaz=sigmaz, beta=beta, ti=tinj,
             xsource=xs, ysource=ys, xtest=xt, ytest=yt,
@@ -71,27 +80,44 @@ wake = WakeSolver(q=q, sigmaz=sigmaz, beta=beta, ti=tinj,
             Ez_file=results_folder+'Ez.h5', 
             save=True, logfile=False)
 
-# ----------- Solver & Simulation ----------
-# boundary conditions``
+# ----------- Solver  ----------
+# boundary conditions
 bc_low=['pec', 'pec', 'pec']
 bc_high=['pec', 'pec', 'pec']
 
+if use_pml:
+    bc_low=['pec', 'pec', 'pml']
+    bc_high=['pec', 'pec', 'pml']
+
 solver = SolverFIT3D(grid, wake, cfln=0.3,
                      bc_low=bc_low, bc_high=bc_high, 
-                     use_stl=True, bg=background)
+                     use_stl=True, bg=background,
+                     n_pml=n_pml)
+
+# Add windows manually
+for d in ['x', 'y', 'z']:
+    solver.ieps[:, :, -3-n_pml:-n_pml, d] = 1/(stl_materials['windows'][0]*epsilon_0)
+    solver.ieps[:, :, n_pml:3+n_pml, d] = 1/(stl_materials['windows'][0]*epsilon_0)
+    solver.sigma[:, :, -3-n_pml:-n_pml, d] = stl_materials['windows'][2]
+    solver.sigma[:, :, n_pml:3+n_pml, d] = stl_materials['windows'][2]
+
+solver.update_tensors()
+
+# -----------  Simulation ----------
 # Plot settings
 img_folder = results_folder+'img/'
 if not os.path.exists(img_folder): os.mkdir(img_folder)
 plotkw = {'title': img_folder+'Ez', 
             #'add_patch':'pipe', 'patch_alpha':0.3,
+            'dpi':200,
             'figsize':[12,12],
             'vmin':-1e4, 'vmax':1e4,
             'cmap':'bwr',
-            'plane': [int(Nx/2), slice(0, Ny), slice(0, Nz)]}
+            'plane': [int(Nx/2), slice(n_pml, Ny-n_pml), slice(n_pml, Nz-n_pml)],}
 
 # Run wakefield time-domain simulation
-solver.wakesolve(wakelength=wakelength, add_space=add_space,
-                plot=True, plot_from=200, plot_every=20, plot_until=7000,
+solver.wakesolve(wakelength=wakelength, add_space=add_space+n_pml,
+                plot=True, plot_from=800, plot_every=20, plot_until=7000,
                 save_J=False,
                 **plotkw)    
 
@@ -124,27 +150,32 @@ if plot:
 
     plt.show()
 
-plot = True
+plot = False
 if plot:
     fig, ax = plt.subplots(1,2, figsize=[12,4], dpi=150)
-    folders = ['results_BCpec_nz100', 'results_BCpec_nz150']
-    colors = ['tab:red', 'tab:blue', 'tab:green']
-    legend = ['Nz = 100', 'Nz = 150', 'pml']
+    folders = ['results_BCpec_nz150', 'results_lossy_BCpec_nz150', 'results_lossy+windows_BCpec_nz150', 'results_lossy+windows_BCpml_nz150_addspace']
+    colors = ['tab:red', 'tab:blue', 'tab:green', 'tab:orange']
+    legend = ['PEC cavity', 'Copper Cavity', 'Copper cavity + Be Windows', 'Copper cavity + Be Windows + PML']
     for i, folder in enumerate(folders):
         wake.load_results(folder)
         
-        ax[0].plot(wake.s*1e3, wake.WP, c=colors[i], lw=1.5, label=f'WP {legend[i]}')
+        ax[0].plot(wake.s*1e3, wake.WP, c=colors[i], lw=1.5, alpha=0.8, label=f'WP {legend[i]}')
         ax[0].set_xlabel('s [mm]')
         ax[0].set_ylabel('Longitudinal wake potential [V/pC]', color='r')
-        ax[0].legend()
+        ax[0].legend(fontsize=8)
 
-        ax[1].plot(wake.f*1e-9, np.real(wake.Z), c=colors[i], ls='--', label=f'Re(Z) {legend[i]}')
-        ax[1].plot(wake.f*1e-9, np.imag(wake.Z), c=colors[i], ls=':', label=f'Im(Z) {legend[i]}')
-        ax[1].plot(wake.f*1e-9, np.abs(wake.Z), c=colors[i], ls='-',  label=f'Abs(Z) {legend[i]}')
-
+        if i == 0:
+            ax[1].plot(wake.f*1e-9, np.real(wake.Z), c=colors[i], alpha=0.8, ls='--', label=f'Re(Z) {legend[i]}')
+            ax[1].plot(wake.f*1e-9, np.imag(wake.Z), c=colors[i], alpha=0.8, ls=':', label=f'Im(Z) {legend[i]}')
+            ax[1].plot(wake.f*1e-9, np.abs(wake.Z), c=colors[i], alpha=0.8, ls='-',  label=f'Abs(Z) {legend[i]}')
+        else:
+            ax[1].plot(wake.f*1e-9, np.real(wake.Z), c=colors[i], alpha=0.8, ls='--',)
+            ax[1].plot(wake.f*1e-9, np.imag(wake.Z), c=colors[i],alpha=0.8, ls=':',)
+            ax[1].plot(wake.f*1e-9, np.abs(wake.Z), c=colors[i],alpha=0.8, ls='-',  label=f'Abs(Z) {legend[i]}')
+        
         ax[1].set_xlabel('f [GHz]')
         ax[1].set_ylabel(r'Longitudinal impedance [Abs][$\Omega$]', color='b')
-        ax[1].legend()
+        ax[1].legend(fontsize=8)
 
     fig.tight_layout()
     fig.savefig(f'{results_folder}compare.png')
